@@ -60,6 +60,13 @@ constexpr uint64_t FILE_MAGIC = 0x004b4e53454c4946ULL; // FILESNK\0
 constexpr uint64_t STF_MAGIC = 0x00454d4954425553ULL;  // SUBTIME\0
 constexpr uint64_t TRL_MAGIC = 0x004c5254454c4946ULL;  // FILETRL\0
 constexpr uint8_t HEARTBEAT_HEAD = 0x1c;
+constexpr uint32_t HBF_MASK = 0x00ffffffu;
+
+static uint32_t next_hbf(uint32_t hb) {
+    // HBF is a 24-bit cyclic counter:
+    // ... 0xfffffe, 0xffffff, 0x000000, 0x000001, ...
+    return (hb + 1u) & HBF_MASK;
+}
 
 struct Record {
     uint32_t tfid;
@@ -308,11 +315,11 @@ int main(int argc, char** argv) {
 
                     uint8_t head = uint8_t((word >> 58) & 0x3f);
                     if (head == HEARTBEAT_HEAD) {
-                        uint32_t hb = uint32_t(word & 0x00ffffffu);
+                        uint32_t hb = uint32_t(word & HBF_MASK);
                         if (!rec.hb_seen) {
                             rec.hb_seen = true;
                             rec.first_hb = hb;
-                        } else if (hb != ((prev_hb + 1u) & 0x00ffffffu)) {
+                        } else if (hb != next_hbf(prev_hb)) {
                             ++rec.internal_hb_gaps;
                         }
                         prev_hb = hb;
@@ -371,6 +378,8 @@ int main(int argc, char** argv) {
         outidx[order[i]] = i;
     }
 
+    // Do not sort by HBF number. HBF is a cyclic 24-bit counter, so after
+    // 0xffffff the following 0x000000 must remain later in the data stream.
     std::stable_sort(records.begin(), records.end(), [](const Record& a, const Record& b) {
         if (a.femid != b.femid) {
             return a.femid < b.femid;
@@ -392,7 +401,7 @@ int main(int argc, char** argv) {
             s.seen = true;
             s.first = r.first_hb;
         } else {
-            uint32_t expected = (s.last + 1u) & 0x00ffffffu;
+            uint32_t expected = next_hbf(s.last);
             if (r.first_hb != expected) {
                 ++s.discontinuities;
                 if (s.first_gaps.size() < 10) {
