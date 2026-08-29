@@ -2,7 +2,7 @@
 
 Utility for sorting NestDAQ FileSink raw data produced with auto sub-channel enabled.
 
-The program reads three input raw-data files, groups SubTimeFrames by `femId`, sorts them by `femId` and TimeFrame ID, and writes three output files in ascending `femId` order.
+The program automatically detects matching input raw-data files under the input root directory, groups SubTimeFrames by `femId`, sorts them by `femId` and TimeFrame ID, and writes one output file per detected `femId` in ascending order.
 
 STF contents are copied byte-for-byte. Heartbeat headers, heartbeat frame delimiters, and payload data are not rewritten.
 
@@ -27,7 +27,7 @@ g++ -O3 -DNDEBUG -std=c++17 -Wall -Wextra -Wpedantic sort_rawdata_by_femid.cc -o
 ## Usage
 
 ```bash
-./sort_rawdata_by_femid RUNFILE [INPUT_ROOT] [OUTPUT_ROOT]
+./sort_rawdata_by_femid RUNFILE [INPUT_ROOT_DIR] [OUTPUT_ROOT_DIR]
 ```
 
 Help:
@@ -43,15 +43,17 @@ Default input layout:
 ```text
 rawdata/00/RUNFILE
 rawdata/01/RUNFILE
-rawdata/02/RUNFILE
+...
 ```
+
+All matching `INPUT_ROOT_DIR/*/RUNFILE` files are detected automatically.
 
 Default output layout:
 
 ```text
 rawdata_sorted/00/RUNFILE   lowest femId
 rawdata_sorted/01/RUNFILE
-rawdata_sorted/02/RUNFILE   highest femId
+...                         femId ascending
 ```
 
 Example:
