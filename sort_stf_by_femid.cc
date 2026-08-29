@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <set>
 #include <sstream>
@@ -61,6 +62,7 @@ constexpr uint64_t STF_MAGIC = 0x00454d4954425553ULL;  // SUBTIME\0
 constexpr uint64_t TRL_MAGIC = 0x004c5254454c4946ULL;  // FILETRL\0
 constexpr uint8_t HEARTBEAT_HEAD = 0x1c;
 constexpr uint32_t HBF_MASK = 0x00ffffffu;
+constexpr uint32_t HBF_MODULO = HBF_MASK + 1u;
 
 static uint32_t next_hbf(uint32_t hb) {
     // HBF is a 24-bit cyclic counter:
@@ -68,18 +70,61 @@ static uint32_t next_hbf(uint32_t hb) {
     return (hb + 1u) & HBF_MASK;
 }
 
+static uint32_t hbf_distance(uint32_t hb, uint32_t anchor) {
+    // Forward distance on the 24-bit ring.  Thus, with an anchor near the
+    // end of the counter range, 0x000000 naturally follows 0xffffff.
+    return (hb - anchor) & HBF_MASK;
+}
+
+static uint32_t find_hbf_anchor(std::vector<uint32_t> points) {
+    if (points.empty()) {
+        return 0;
+    }
+
+    std::sort(points.begin(), points.end());
+    points.erase(std::unique(points.begin(), points.end()), points.end());
+
+    if (points.size() == 1) {
+        return points.front();
+    }
+
+    // Choose the first HBF after the largest unused interval on the 24-bit
+    // ring.  This rotates the numeric order at the run boundary instead of
+    // at 0x000000.  Example:
+    //   0xf4.... -> ... -> 0xffffff -> 0x000000 -> ... -> 0x70....
+    // remains in exactly that chronological order.
+    uint32_t anchor = points.front();
+    uint32_t largest_gap = 0;
+
+    for (size_t i = 0; i + 1 < points.size(); ++i) {
+        uint32_t gap = points[i + 1] - points[i];
+        if (gap > largest_gap) {
+            largest_gap = gap;
+            anchor = points[i + 1];
+        }
+    }
+
+    uint32_t wrap_gap = (points.front() - points.back()) & HBF_MASK;
+    if (wrap_gap > largest_gap) {
+        anchor = points.front();
+    }
+
+    return anchor;
+}
+
 struct Record {
-    uint32_t tfid;
-    uint32_t femid;
-    uint32_t length;
-    size_t input_index;
-    uint64_t offset;
-    uint64_t serial;
+    uint32_t tfid = 0;
+    uint32_t femid = 0;
+    uint32_t length = 0;
+    size_t input_index = 0;
+    uint64_t offset = 0;
+    uint64_t serial = 0;
     bool hb_seen = false;
     uint32_t first_hb = 0;
     uint32_t last_hb = 0;
     uint32_t hb_count = 0;
     uint32_t internal_hb_gaps = 0;
+    uint32_t hbf_sort_key = std::numeric_limits<uint32_t>::max();
 };
 
 struct HbfStats {
@@ -110,6 +155,12 @@ static uint64_t filesize(std::ifstream& f) {
     auto e = f.tellg();
     f.seekg(p);
     return static_cast<uint64_t>(e);
+}
+
+static std::string hex24(uint32_t v) {
+    std::ostringstream os;
+    os << "0x" << std::hex << std::setw(6) << std::setfill('0') << (v & HBF_MASK);
+    return os.str();
 }
 
 static std::string hex32(uint32_t v) {
@@ -165,7 +216,8 @@ static void print_help(const char* prog) {
         << "Sort NestDAQ FileSink raw data split by auto sub-channel into N\n"
         << "output files grouped by femId (ascending). Input subdirectories are detected\n"
         << "automatically. STF byte contents are copied unchanged. HBF number continuity\n"
-        << "and input/output total size are checked.\n\n"
+        << "and input/output total size are checked. HBF is treated as a cyclic 24-bit\n"
+        << "counter, so 0x000000 remains after 0xffffff when a run crosses the wrap.\n\n"
         << "Arguments:\n"
         << "  RUNFILE          Raw-data filename, e.g. run000020.dat\n"
         << "  INPUT_ROOT_DIR   Input root directory  (default: rawdata)\n"
@@ -249,6 +301,7 @@ int main(int argc, char** argv) {
 
     std::vector<Record> records;
     records.reserve(static_cast<size_t>(input_total / 256));
+    std::vector<uint32_t> hbf_points;
     std::set<uint32_t> femids;
     uint64_t serial = 0;
     uint64_t scan_done = 0;
@@ -267,7 +320,10 @@ int main(int argc, char** argv) {
         x.header.resize(sizeof(FileHeader));
         x.f.clear();
         x.f.seekg(0);
-        read_exact(x.f, x.header.data(), x.header.size());
+        if (!read_exact(x.f, x.header.data(), static_cast<std::streamsize>(x.header.size()))) {
+            std::cerr << "\nERROR: cannot reread FileSink header: " << x.path << "\n";
+            return 4;
+        }
         scan_done += sizeof(FileHeader);
         scanprog.update(scan_done);
 
@@ -298,7 +354,14 @@ int main(int argc, char** argv) {
                     return 6;
                 }
 
-                Record rec{sh.timeFrameId, sh.femId, sh.length, fi, uint64_t(pos), serial++};
+                Record rec;
+                rec.tfid = sh.timeFrameId;
+                rec.femid = sh.femId;
+                rec.length = sh.length;
+                rec.input_index = fi;
+                rec.offset = uint64_t(pos);
+                rec.serial = serial++;
+
                 femids.insert(sh.femId);
                 stf_bytes += sh.length;
 
@@ -328,7 +391,11 @@ int main(int argc, char** argv) {
                     }
                 }
 
+                if (rec.hb_seen) {
+                    hbf_points.push_back(rec.first_hb);
+                }
                 records.push_back(rec);
+
                 uint64_t rem = payload % 8;
                 if (rem) {
                     x.f.seekg(static_cast<std::streamoff>(rem), std::ios::cur);
@@ -378,12 +445,38 @@ int main(int argc, char** argv) {
         outidx[order[i]] = i;
     }
 
-    // Do not sort by HBF number. HBF is a cyclic 24-bit counter, so after
-    // 0xffffff the following 0x000000 must remain later in the data stream.
-    std::stable_sort(records.begin(), records.end(), [](const Record& a, const Record& b) {
+    bool have_hbf_anchor = !hbf_points.empty();
+    uint32_t hbf_anchor = have_hbf_anchor ? find_hbf_anchor(std::move(hbf_points)) : 0;
+
+    if (have_hbf_anchor) {
+        std::cout << "HBF cyclic sort anchor: " << hex24(hbf_anchor)
+                  << " (" << hbf_anchor << ")\n";
+        for (auto& r : records) {
+            if (r.hb_seen) {
+                r.hbf_sort_key = hbf_distance(r.first_hb, hbf_anchor);
+            }
+        }
+    } else {
+        std::cout << "WARNING: no HBF headers found; falling back to TimeFrame ID order.\n";
+    }
+
+    // Sort each FEE in chronological HBF order on the 24-bit ring.  We do
+    // NOT use the raw numeric HBF value as the key.  Therefore a wrapped
+    // 0x000000 stays after 0xffffff instead of being moved to the front.
+    std::stable_sort(records.begin(), records.end(), [have_hbf_anchor](const Record& a, const Record& b) {
         if (a.femid != b.femid) {
             return a.femid < b.femid;
         }
+
+        if (have_hbf_anchor) {
+            if (a.hb_seen != b.hb_seen) {
+                return a.hb_seen;
+            }
+            if (a.hb_seen && a.hbf_sort_key != b.hbf_sort_key) {
+                return a.hbf_sort_key < b.hbf_sort_key;
+            }
+        }
+
         if (a.tfid != b.tfid) {
             return a.tfid < b.tfid;
         }
@@ -424,31 +517,40 @@ int main(int argc, char** argv) {
                   << "  last=" << (s.seen ? std::to_string(s.last) : "N/A")
                   << "  count=" << s.count
                   << "  discontinuities=" << s.discontinuities << "\n";
-        for (auto& g : s.first_gaps) {
+        for (const auto& g : s.first_gaps) {
             std::cout << "       gap: " << g.first << " -> " << g.second << "\n";
         }
     }
 
-    bool same_start = true;
-    uint32_t start_hb = hbf[order[0]].first;
+    bool same_start = !order.empty() && hbf[order[0]].seen;
+    uint32_t start_hb = same_start ? hbf[order[0]].first : 0;
     for (auto id : order) {
         same_start &= hbf[id].seen && hbf[id].first == start_hb;
     }
     std::cout << "  start alignment: "
               << (same_start ? "OK (all equal)" : "WARNING (different)") << "\n";
 
-    uint32_t minlast = 0xffffff;
-    uint32_t maxlast = 0;
+    bool have_all_stops = have_hbf_anchor;
+    uint32_t min_stop_pos = HBF_MASK;
+    uint32_t max_stop_pos = 0;
     for (auto id : order) {
-        minlast = std::min(minlast, hbf[id].last);
-        maxlast = std::max(maxlast, hbf[id].last);
+        if (!hbf[id].seen) {
+            have_all_stops = false;
+            break;
+        }
+        uint32_t pos = hbf_distance(hbf[id].last, hbf_anchor);
+        min_stop_pos = std::min(min_stop_pos, pos);
+        max_stop_pos = std::max(max_stop_pos, pos);
     }
-    std::cout << "  stop spread    : " << (maxlast - minlast)
-              << " HBF (simple non-wrap comparison)\n";
+    if (have_all_stops) {
+        std::cout << "  stop spread    : " << (max_stop_pos - min_stop_pos)
+                  << " HBF (24-bit wrap-aware)\n";
+    } else {
+        std::cout << "  stop spread    : N/A\n";
+    }
 
     std::vector<std::ofstream> out(order.size());
     std::vector<fs::path> outpath(order.size());
-    std::vector<uint64_t> outbytes(order.size(), 0);
     std::vector<uint64_t> outstf(order.size(), 0);
 
     for (size_t i = 0; i < order.size(); ++i) {
@@ -462,7 +564,6 @@ int main(int argc, char** argv) {
             return 12;
         }
         out[i].write(in[i].header.data(), static_cast<std::streamsize>(in[i].header.size()));
-        outbytes[i] += in[i].header.size();
     }
 
     uint64_t copy_total = stf_bytes;
@@ -491,7 +592,6 @@ int main(int argc, char** argv) {
             }
             left -= n;
             copy_done += n;
-            outbytes[oi] += n;
             copyprog.update(copy_done);
         }
         ++outstf[oi];
@@ -500,7 +600,6 @@ int main(int argc, char** argv) {
 
     for (size_t i = 0; i < order.size(); ++i) {
         out[i].write(in[i].trailer.data(), static_cast<std::streamsize>(in[i].trailer.size()));
-        outbytes[i] += in[i].trailer.size();
         out[i].close();
     }
 
