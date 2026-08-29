@@ -2,7 +2,7 @@
 
 Utility for sorting NestDAQ FileSink raw data produced with auto sub-channel enabled.
 
-The program automatically detects matching input raw-data files under the input root directory, groups SubTimeFrames by `femId`, sorts them by `femId` and TimeFrame ID, and writes one output file per detected `femId` in ascending order.
+The program automatically detects input raw-data files under `INPUT_ROOT_DIR`, groups SubTimeFrames by `femId`, sorts them by `femId` and TimeFrame ID, and writes output files in ascending `femId` order.
 
 STF contents are copied byte-for-byte. Heartbeat headers, heartbeat frame delimiters, and payload data are not rewritten.
 
@@ -21,21 +21,21 @@ make
 or directly:
 
 ```bash
-g++ -O3 -DNDEBUG -std=c++17 -Wall -Wextra -Wpedantic sort_rawdata_by_femid.cc -o sort_rawdata_by_femid
+g++ -O3 -DNDEBUG -std=c++17 -Wall -Wextra -Wpedantic sort_stf_by_femid.cc -o sort_stf_by_femid
 ```
 
 ## Usage
 
 ```bash
-./sort_rawdata_by_femid RUNFILE [INPUT_ROOT_DIR] [OUTPUT_ROOT_DIR]
+./sort_stf_by_femid RUNFILE [INPUT_ROOT_DIR] [OUTPUT_ROOT_DIR]
 ```
 
 Help:
 
 ```bash
-./sort_rawdata_by_femid
-./sort_rawdata_by_femid -h
-./sort_rawdata_by_femid --help
+./sort_stf_by_femid
+./sort_stf_by_femid -h
+./sort_stf_by_femid --help
 ```
 
 Default input layout:
@@ -46,7 +46,7 @@ rawdata/01/RUNFILE
 ...
 ```
 
-All matching `INPUT_ROOT_DIR/*/RUNFILE` files are detected automatically.
+All matching subdirectories are detected automatically.
 
 Default output layout:
 
@@ -59,13 +59,13 @@ rawdata_sorted/01/RUNFILE
 Example:
 
 ```bash
-./sort_rawdata_by_femid run000020.dat
+./sort_stf_by_femid run000020.dat
 ```
 
 or:
 
 ```bash
-./sort_rawdata_by_femid run000020.dat rawdata rawdata_sorted
+./sort_stf_by_femid run000020.dat rawdata rawdata_sorted
 ```
 
 During processing, scan/copy progress and throughput are displayed.
