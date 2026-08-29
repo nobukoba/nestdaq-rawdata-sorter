@@ -1,6 +1,6 @@
 CXX ?= g++
-TARGET := sort_rawdata_by_femid
-SRC := sort_rawdata_by_femid.cc
+TARGET := sort_stf_by_femid
+SRC := sort_stf_by_femid.cc
 CXXFLAGS ?= -O3 -DNDEBUG -std=c++17 -Wall -Wextra -Wpedantic
 
 .PHONY: all clean help
