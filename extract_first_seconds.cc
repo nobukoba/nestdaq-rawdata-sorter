@@ -141,8 +141,11 @@ static void print_help(const char* prog) {
         << "The cut is made only at SubTimeFrame (STF) boundaries, so STF contents\n"
         << "are copied byte-for-byte and are never truncated. The first STF timestamp\n"
         << "is used as t=0 for selecting STFs.\n\n"
-        << "For the output FileSink header/trailer timestamps, HBF timing is used:\n"
-        << "  HBF start ~= startUnixtime + 1 s\n"
+        << "All retained raw-data bytes are preserved unchanged except stopUnixtime\n"
+        << "in the FileSink header/trailer. startUnixtime, HBF numbers, STF headers,\n"
+        << "payload data, run number, and comments are not rewritten.\n\n"
+        << "For the output stop timestamp, HBF timing is used:\n"
+        << "  HBF start ~= original startUnixtime + 1 s\n"
         << "  HBF period = 524.288 us\n"
         << "  stopUnixtime = one second after the end of the last copied HBF\n"
         << "The 24-bit HBF counter wrap 0xffffff -> 0x000000 is handled.\n\n"
@@ -303,17 +306,17 @@ int main(int argc, char** argv) {
     const long double hbf_duration_sec = static_cast<long double>(hbf_count) * HBF_PERIOD_SEC;
 
     // FileSink stores Unix time as whole seconds. HBF acquisition starts about
-    // one second after startUnixtime. The requested stop time is one second
-    // after the last copied HBF has finished. Fractional seconds are discarded
-    // in the same way as time_t/Unix-second storage.
+    // one second after the original startUnixtime. The requested stop time is
+    // one second after the last copied HBF has finished.
     const int64_t shortened_stop =
         fh.startUnixtime
         + HBF_START_DELAY_SEC
         + static_cast<int64_t>(hbf_duration_sec)
         + HBF_STOP_DELAY_SEC;
 
+    // These are the only two field writes. All other retained bytes are copied
+    // unchanged from the input file.
     fh.stopUnixtime = shortened_stop;
-    out_tr.startUnixtime = fh.startUnixtime;
     out_tr.stopUnixtime = shortened_stop;
 
     std::ofstream out(output_path, std::ios::binary | std::ios::trunc);
@@ -354,8 +357,7 @@ int main(int argc, char** argv) {
               << "Copied STF count   : " << copied_stfs << "\n"
               << "Copied STF bytes   : " << copied_stf_bytes << "\n"
               << "Output bytes       : " << (sizeof(FileHeader) + copied_stf_bytes + sizeof(FileTrailer)) << "\n"
-              << "startUnixtime      : " << fh.startUnixtime << "\n"
-              << "HBF nominal start  : " << (fh.startUnixtime + HBF_START_DELAY_SEC) << "\n"
+              << "startUnixtime      : " << fh.startUnixtime << " (unchanged)\n"
               << "New stopUnixtime   : " << shortened_stop << "\n";
 
     return 0;
