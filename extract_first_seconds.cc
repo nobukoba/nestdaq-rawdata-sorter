@@ -53,6 +53,12 @@ constexpr uint64_t FILE_MAGIC = 0x004b4e53454c4946ULL; // FILESNK\0
 constexpr uint64_t STF_MAGIC  = 0x00454d4954425553ULL; // SUBTIME\0
 constexpr uint64_t TRL_MAGIC  = 0x004c5254454c4946ULL; // FILETRL\0
 
+constexpr uint8_t HEARTBEAT_HEAD = 0x1c;
+constexpr uint32_t HBF_MASK = 0x00ffffffu;
+constexpr long double HBF_PERIOD_SEC = 524.288e-6L;
+constexpr int64_t HBF_START_DELAY_SEC = 1;
+constexpr int64_t HBF_STOP_DELAY_SEC = 1;
+
 static bool read_exact(std::ifstream& f, void* p, std::streamsize n) {
     f.read(reinterpret_cast<char*>(p), n);
     return f.gcount() == n;
@@ -80,6 +86,51 @@ static long double stf_time_us(const STFHeader& sh) {
          + static_cast<long double>(sh.timeUSec);
 }
 
+static uint32_t hbf_distance(uint32_t hb, uint32_t anchor) {
+    return (hb - anchor) & HBF_MASK;
+}
+
+struct HbfRange {
+    bool seen = false;
+    uint32_t first = 0;
+    uint32_t last = 0;
+};
+
+static bool scan_hbf_in_stf(std::ifstream& in,
+                            std::streampos stf_pos,
+                            const STFHeader& sh,
+                            HbfRange& range) {
+    const uint64_t payload_bytes = sh.length - sizeof(STFHeader);
+    const uint64_t nwords = payload_bytes / sizeof(uint64_t);
+
+    in.clear();
+    in.seekg(stf_pos + static_cast<std::streamoff>(sizeof(STFHeader)));
+    if (!in) {
+        return false;
+    }
+
+    for (uint64_t i = 0; i < nwords; ++i) {
+        uint64_t word = 0;
+        if (!read_exact(in, &word, sizeof(word))) {
+            return false;
+        }
+
+        const uint8_t head = static_cast<uint8_t>((word >> 58) & 0x3f);
+        if (head != HEARTBEAT_HEAD) {
+            continue;
+        }
+
+        const uint32_t hb = static_cast<uint32_t>(word & HBF_MASK);
+        if (!range.seen) {
+            range.seen = true;
+            range.first = hb;
+        }
+        range.last = hb;
+    }
+
+    return true;
+}
+
 static void print_help(const char* prog) {
     std::cout
         << "Usage:\n"
@@ -89,8 +140,12 @@ static void print_help(const char* prog) {
         << "approximately SECONDS seconds of data (default: 10.0 s).\n\n"
         << "The cut is made only at SubTimeFrame (STF) boundaries, so STF contents\n"
         << "are copied byte-for-byte and are never truncated. The first STF timestamp\n"
-        << "is used as t=0. FileSink header/trailer stopUnixtime values are updated\n"
-        << "to the last copied STF second.\n\n"
+        << "is used as t=0 for selecting STFs.\n\n"
+        << "For the output FileSink header/trailer timestamps, HBF timing is used:\n"
+        << "  HBF start ~= startUnixtime + 1 s\n"
+        << "  HBF period = 524.288 us\n"
+        << "  stopUnixtime = one second after the end of the last copied HBF\n"
+        << "The 24-bit HBF counter wrap 0xffffff -> 0x000000 is handled.\n\n"
         << "Example:\n"
         << "  " << prog << " run000020.dat run000020_first10s.dat\n"
         << "  " << prog << " run000020.dat run000020_first5s.dat 5\n";
@@ -140,6 +195,7 @@ int main(int argc, char** argv) {
     long double last_us = -1.0L;
     uint64_t copied_stfs = 0;
     uint64_t copied_stf_bytes = 0;
+    HbfRange hbf_range;
 
     while (true) {
         const auto pos = in.tellg();
@@ -157,11 +213,6 @@ int main(int argc, char** argv) {
         in.seekg(pos);
 
         if (magic == TRL_MAGIC) {
-            FileTrailer tr{};
-            if (!read_exact(in, &tr, sizeof(tr))) {
-                std::cerr << "ERROR: truncated FileTrailer.\n";
-                return 5;
-            }
             break;
         }
         if (magic != STF_MAGIC) {
@@ -194,9 +245,17 @@ int main(int argc, char** argv) {
             break;
         }
 
+        if (!scan_hbf_in_stf(in, pos, sh, hbf_range)) {
+            std::cerr << "ERROR: failed to scan HBF words in STF at byte "
+                      << static_cast<uint64_t>(pos) << ".\n";
+            return 5;
+        }
+
         last_us = t_us;
         ++copied_stfs;
         copied_stf_bytes += sh.length;
+
+        in.clear();
         in.seekg(pos + static_cast<std::streamoff>(sh.length));
         if (!in) {
             std::cerr << "ERROR: STF extends beyond input file.\n";
@@ -206,6 +265,10 @@ int main(int argc, char** argv) {
 
     if (copied_stfs == 0 || first_us < 0.0L || last_us < 0.0L) {
         std::cerr << "ERROR: no STF found in requested interval.\n";
+        return 6;
+    }
+    if (!hbf_range.seen) {
+        std::cerr << "ERROR: no HBF header found in copied STF data.\n";
         return 6;
     }
 
@@ -236,8 +299,21 @@ int main(int argc, char** argv) {
         in.seekg(pos + static_cast<std::streamoff>(sh.length));
     }
 
-    const int64_t shortened_stop = static_cast<int64_t>(last_us / 1000000.0L);
+    const uint64_t hbf_count = static_cast<uint64_t>(hbf_distance(hbf_range.last, hbf_range.first)) + 1ULL;
+    const long double hbf_duration_sec = static_cast<long double>(hbf_count) * HBF_PERIOD_SEC;
+
+    // FileSink stores Unix time as whole seconds. HBF acquisition starts about
+    // one second after startUnixtime. The requested stop time is one second
+    // after the last copied HBF has finished. Fractional seconds are discarded
+    // in the same way as time_t/Unix-second storage.
+    const int64_t shortened_stop =
+        fh.startUnixtime
+        + HBF_START_DELAY_SEC
+        + static_cast<int64_t>(hbf_duration_sec)
+        + HBF_STOP_DELAY_SEC;
+
     fh.stopUnixtime = shortened_stop;
+    out_tr.startUnixtime = fh.startUnixtime;
     out_tr.stopUnixtime = shortened_stop;
 
     std::ofstream out(output_path, std::ios::binary | std::ios::trunc);
@@ -264,14 +340,22 @@ int main(int argc, char** argv) {
     }
     out.close();
 
-    const long double actual = (last_us - first_us) / 1000000.0L;
+    const long double actual_stf = (last_us - first_us) / 1000000.0L;
     std::cout << "Created: " << output_path << "\n"
               << "Requested interval : " << std::fixed << std::setprecision(6)
               << seconds << " s\n"
-              << "Last STF start     : " << static_cast<double>(actual) << " s from first STF\n"
+              << "Last STF start     : " << static_cast<double>(actual_stf) << " s from first STF\n"
+              << "First HBF          : 0x" << std::hex << std::setw(6) << std::setfill('0')
+              << hbf_range.first << std::dec << std::setfill(' ') << "\n"
+              << "Last HBF           : 0x" << std::hex << std::setw(6) << std::setfill('0')
+              << hbf_range.last << std::dec << std::setfill(' ') << "\n"
+              << "HBF count/span     : " << hbf_count << "\n"
+              << "HBF duration       : " << static_cast<double>(hbf_duration_sec) << " s\n"
               << "Copied STF count   : " << copied_stfs << "\n"
               << "Copied STF bytes   : " << copied_stf_bytes << "\n"
               << "Output bytes       : " << (sizeof(FileHeader) + copied_stf_bytes + sizeof(FileTrailer)) << "\n"
+              << "startUnixtime      : " << fh.startUnixtime << "\n"
+              << "HBF nominal start  : " << (fh.startUnixtime + HBF_START_DELAY_SEC) << "\n"
               << "New stopUnixtime   : " << shortened_stop << "\n";
 
     return 0;
